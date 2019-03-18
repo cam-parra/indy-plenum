@@ -1,6 +1,5 @@
 import json
 import os
-import random
 import time
 from binascii import unhexlify
 from collections import deque, defaultdict
@@ -51,7 +50,8 @@ from plenum.common.constants import POOL_LEDGER_ID, DOMAIN_LEDGER_ID, \
     OP_FIELD_NAME, CATCH_UP_PREFIX, NYM, \
     GET_TXN, DATA, VERKEY, \
     TARGET_NYM, ROLE, STEWARD, TRUSTEE, ALIAS, \
-    NODE_IP, BLS_PREFIX, NodeHooks, LedgerState, CURRENT_PROTOCOL_VERSION, AUDIT_LEDGER_ID
+    NODE_IP, BLS_PREFIX, NodeHooks, LedgerState, CURRENT_PROTOCOL_VERSION, AUDIT_LEDGER_ID, AUDIT_TXN_LEDGER_ROOT, \
+    AUDIT_TXN_LEDGERS_SIZE
 from plenum.common.exceptions import SuspiciousNode, SuspiciousClient, \
     MissingNodeOp, InvalidNodeOp, InvalidNodeMsg, InvalidClientMsgType, \
     InvalidClientRequest, BaseExc, \
@@ -1245,7 +1245,6 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         self._info_tool.stop()
 
         self.mode = None
-        self.ledgerManager.prepare_ledgers_for_sync()
 
     def closeAllKVStores(self):
         # Clear leveldb lock files
@@ -1303,7 +1302,8 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
             c += await self.serviceClientMsgs(limit)
             with self.metrics.measure_time(MetricsName.SERVICE_NODE_ACTIONS_TIME):
                 c += self._serviceActions()
-            c += self.ledgerManager.service()
+            with self.metrics.measure_time(MetricsName.SERVICE_TIMERS_TIME):
+                self.timer.service()
             with self.metrics.measure_time(MetricsName.SERVICE_MONITOR_ACTIONS_TIME):
                 c += self.monitor._serviceActions()
             c += await self.serviceViewChanger(limit)
@@ -1311,8 +1311,6 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
             c += await self.service_observer(limit)
             with self.metrics.measure_time(MetricsName.FLUSH_OUTBOXES_TIME):
                 self.nodestack.flushOutBoxes()
-            with self.metrics.measure_time(MetricsName.SERVICE_TIMERS_TIME):
-                self.timer.service()
 
         if self.isGoing():
             with self.metrics.measure_time(MetricsName.SERVICE_NODE_LIFECYCLE_TIME):
@@ -1506,8 +1504,7 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         logger.info("{} asking {} for ledger status of ledger {}".format(self, node_name, ledger_id))
 
     def send_ledger_status_to_newly_connected_node(self, node_name):
-        self.sendLedgerStatus(node_name,
-                              self.ledgerManager.ledger_sync_order[0])
+        self.sendLedgerStatus(node_name, POOL_LEDGER_ID)
 
     def nodeJoined(self, txn_data):
         logger.display("{} new node joined by txn {}".format(self, txn_data))
@@ -1515,10 +1512,10 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         self.setPoolParams()
         self.adjustReplicas(old_required_number_of_instances,
                             self.requiredNumberOfInstances)
-        ledgerInfo = self.ledgerManager.getLedgerInfoByType(POOL_LEDGER_ID)
+        leecher = self.ledgerManager._node_leecher._leechers[POOL_LEDGER_ID]
         if self.requiredNumberOfInstances > old_required_number_of_instances \
                 and not self.view_changer.view_change_in_progress \
-                and ledgerInfo.state == LedgerState.synced:
+                and leecher.state == LedgerState.synced:
             # Select primaries must be only after pool ledger catchup
             # or if poolLedger already caughtup and we are ordering node transaction
             self.select_primaries()
@@ -2338,8 +2335,7 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         return False
 
     def num_txns_caught_up_in_last_catchup(self) -> int:
-        count = sum([l.num_txns_caught_up for l in
-                     self.ledgerManager.ledgerRegistry.values()])
+        count = self.ledgerManager._node_leecher.num_txns_caught_up_in_last_catchup()
         logger.info('{} caught up to {} txns in the last catchup'.format(self, count))
         return count
 
@@ -2360,7 +2356,10 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
             self.start_participating()
 
     def getLedger(self, ledgerId) -> Ledger:
-        return self.ledgerManager.getLedgerInfoByType(ledgerId).ledger
+        try:
+            return self.ledgerManager.ledgerRegistry[ledgerId].ledger
+        except KeyError:
+            raise KeyError("Invalid ledger type: {}".format(ledgerId))
 
     def getState(self, ledgerId) -> PruningState:
         return self.states.get(ledgerId)
@@ -2861,12 +2860,9 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         self.metrics.add_event(MetricsName.MSGS_FOR_FUTURE_VIEWS, len(self.msgsForFutureViews))
         self.metrics.add_event(MetricsName.TXN_SEQ_RANGE_TO_3PHASE_KEY, len(self.txn_seq_range_to_3phase_key))
 
-        self.metrics.add_event(MetricsName.LEDGERMANAGER_POOL_UNCOMMITEDS, len(
-            self.ledgerManager.getLedgerInfoByType(0).ledger.uncommittedTxns))
-        self.metrics.add_event(MetricsName.LEDGERMANAGER_DOMAIN_UNCOMMITEDS, len(
-            self.ledgerManager.getLedgerInfoByType(1).ledger.uncommittedTxns))
-        self.metrics.add_event(MetricsName.LEDGERMANAGER_CONFIG_UNCOMMITEDS, len(
-            self.ledgerManager.getLedgerInfoByType(2).ledger.uncommittedTxns))
+        self.metrics.add_event(MetricsName.LEDGERMANAGER_POOL_UNCOMMITEDS, len(self.getLedger(0).uncommittedTxns))
+        self.metrics.add_event(MetricsName.LEDGERMANAGER_DOMAIN_UNCOMMITEDS, len(self.getLedger(1).uncommittedTxns))
+        self.metrics.add_event(MetricsName.LEDGERMANAGER_CONFIG_UNCOMMITEDS, len(self.getLedger(2).uncommittedTxns))
 
         # REPLICAS
         self.metrics.add_event(MetricsName.REPLICA_OUTBOX_MASTER, len(self.master_replica.outBox))
@@ -3198,7 +3194,7 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
                            extra={"cli": "ANNOUNCE",
                                   "tags": ["node-election"]})
 
-    def _do_start_catchup(self, just_started):
+    def _do_start_catchup(self, just_started: bool):
         # Process any already Ordered requests by the replica
         self.force_process_ordered()
 
@@ -3207,9 +3203,7 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         logger.info('{} reverted {} batches before starting catch up'.format(self, r))
 
         self.mode = Mode.starting
-        self.ledgerManager.prepare_ledgers_for_sync()
-        self.ledgerManager.catchup_ledger(self.ledgerManager.ledger_sync_order[0],
-                                          request_ledger_statuses=not just_started)
+        self.ledgerManager.start_catchup(is_initial=just_started)
 
     def start_catchup(self, just_started=False):
         if not self.is_synced and not just_started:
@@ -3259,6 +3253,10 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         return self.clientAuthNr
 
     def three_phase_key_for_txn_seq_no(self, ledger_id, seq_no):
+        # TODO: This is a temporary workaround until INDY-1946 is implemented
+        if ledger_id == AUDIT_LEDGER_ID:
+            return self._three_phase_key_for_audit_txn_seq_no(seq_no)
+
         if ledger_id in self.txn_seq_range_to_3phase_key:
             # point query in interval tree
             s = self.txn_seq_range_to_3phase_key[ledger_id][seq_no]
@@ -3268,6 +3266,33 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
                 assert len(s) == 1  # TODO add test for that and remove assert
                 return s.pop().data
         return None
+
+    def _three_phase_key_for_audit_txn_seq_no(self, audit_seq_no):
+        try:
+            txn = self._auditLedger.getBySeqNo(audit_seq_no)
+        except KeyError:
+            return None
+
+        if txn is None:
+            return None
+        txn = get_payload_data(txn)
+        updated_ledgers = [ledger_id for ledger_id, root_hash in txn[AUDIT_TXN_LEDGER_ROOT].items()
+                           if isinstance(root_hash, str)]
+        if not updated_ledgers:
+            return None
+
+        result = None
+        ledgers_size = txn[AUDIT_TXN_LEDGERS_SIZE]
+        for ledger_id in updated_ledgers:
+            seq_no = ledgers_size.get(ledger_id)
+            if seq_no is None:
+                continue
+            three_pc_key = self.three_phase_key_for_txn_seq_no(ledger_id, seq_no)
+            if three_pc_key is None:
+                continue
+            if result is None or compare_3PC_keys(result, three_pc_key) > 0:
+                result = three_pc_key
+        return result
 
     @measure_time(MetricsName.EXECUTE_BATCH_TIME)
     def executeBatch(self, view_no, pp_seq_no: int, pp_time: float,
