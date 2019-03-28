@@ -383,7 +383,12 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         # the batch in which those transactions were included. The txn range is
         # exclusive of last seq no so to store txns from 1 to 100 add a range
         # of `1:101`
-        self.txn_seq_range_to_3phase_key = {}  # type: Dict[int, IntervalTree]
+        # Second element of list stands for freshness 3pc.
+        # It is set to None by default and when txn batch ordered.
+        # When it is None LedgerStatus takes last from IntervalTree
+        # It is set to 3pc number when freshness or empty batch ordered
+        # When it is set to some number, LedgerStatus takes it
+        self.txn_seq_range_to_3phase_key = {}  # type: Dict[int, List[IntervalTree, Tuple[int, int]]]
 
         # Number of rounds of catchup done during a view change.
         self.catchup_rounds_without_txns = 0
@@ -2148,7 +2153,7 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         pass
 
     def postAuditLedgerCaughtUp(self, **kwargs):
-        pass
+        self.audit_handler.on_catchup_finished()
 
     def preLedgerCatchUp(self, ledger_id):
         # Process any Ordered requests. This causes less transactions to be
@@ -2162,7 +2167,13 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         r = self.master_replica.revert_unordered_batches()
         logger.info('{} reverted {} batches before starting catch up for ledger {}'.format(self, r, ledger_id))
 
+        if len(self.auditLedger.uncommittedTxns) > 0:
+            raise LogicError('{} audit ledger has uncommitted txns before catching up ledger {}'.format(self, ledger_id))
+
     def postLedgerCatchUp(self, ledger_id, last_caughtup_3pc):
+        if len(self.auditLedger.uncommittedTxns) > 0:
+            raise LogicError('{} audit ledger has uncommitted txns after catching up ledger {}'.format(self, ledger_id))
+
         # update 3PC key interval tree to return last ordered to other nodes in Ledger Status
         self._update_txn_seq_range_to_3phase_after_catchup(ledger_id, last_caughtup_3pc)
 
@@ -2742,15 +2753,15 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
             for message in messages:
                 self.try_processing_ordered(message)
                 num_processed += 1
-            logger.debug('{} processed {} Ordered batches for instance {} '
-                         'before starting catch up'
-                         .format(self, num_processed, instance_id))
+            logger.info('{} processed {} Ordered batches for instance {} '
+                        'before starting catch up'
+                        .format(self, num_processed, instance_id))
 
     def try_processing_ordered(self, msg):
         if self.isParticipating:
             self.processOrdered(msg)
         else:
-            logger.debug("{} stashing {} since mode is {}".format(self, msg, self.mode))
+            logger.info("{} stashing {} since mode is {}".format(self, msg, self.mode))
             self.stashedOrderedReqs.append(msg)
 
     def processEscalatedException(self, ex):
@@ -3259,7 +3270,13 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
 
         if ledger_id in self.txn_seq_range_to_3phase_key:
             # point query in interval tree
-            s = self.txn_seq_range_to_3phase_key[ledger_id][seq_no]
+            pair_3pc = self.txn_seq_range_to_3phase_key[ledger_id]
+            # pair_3pc[1] stands for last freshness batch
+            if pair_3pc[1] is not None:
+                return pair_3pc[1]
+            else:
+                s = pair_3pc[0][seq_no]
+
             if s:
                 # There should not be more than one interval for any seq no in
                 # the tree
@@ -3342,7 +3359,16 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
         # TODO is it possible to get len(committedTxns) != len(valid_reqs)
         # someday
         if not committedTxns:
+            self._update_txn_seq_range_to_3phase(None, None,
+                                                 ledger_id,
+                                                 view_no, pp_seq_no)
             return
+        else:
+            first_txn_seq_no = get_seq_no(committedTxns[0])
+            last_txn_seq_no = get_seq_no(committedTxns[-1])
+            self._update_txn_seq_range_to_3phase(first_txn_seq_no, last_txn_seq_no,
+                                                 ledger_id,
+                                                 view_no, pp_seq_no)
 
         logger.debug("{} committed batch request, view no {}, ppSeqNo {}, "
                      "ledger {}, state root {}, txn root {}, requests: {}".
@@ -3353,13 +3379,6 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
             self.execute_hook(NodeHooks.POST_REQUEST_COMMIT, txn=txn,
                               pp_time=pp_time, state_root=state_root,
                               txn_root=txn_root)
-
-        first_txn_seq_no = get_seq_no(committedTxns[0])
-        last_txn_seq_no = get_seq_no(committedTxns[-1])
-
-        self._update_txn_seq_range_to_3phase(first_txn_seq_no, last_txn_seq_no,
-                                             ledger_id,
-                                             view_no, pp_seq_no)
 
         reqs = []
         reqs_list_built = True
@@ -3387,11 +3406,17 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
 
     def _update_txn_seq_range_to_3phase(self, first_txn_seq_no, last_txn_seq_no,
                                         ledger_id, view_no, pp_seq_no):
+        is_freshness = first_txn_seq_no is None and last_txn_seq_no is None
         if ledger_id not in self.txn_seq_range_to_3phase_key:
-            self.txn_seq_range_to_3phase_key[ledger_id] = IntervalTree()
+            self.txn_seq_range_to_3phase_key[ledger_id] = [IntervalTree(), None]
         # adding one to end of range since its exclusive
-        intrv_tree = self.txn_seq_range_to_3phase_key[ledger_id]
-        intrv_tree[first_txn_seq_no:last_txn_seq_no + 1] = (view_no, pp_seq_no)
+        intrv_tree = self.txn_seq_range_to_3phase_key[ledger_id][0]
+
+        if is_freshness:
+            self.txn_seq_range_to_3phase_key[ledger_id][1] = (view_no, pp_seq_no)
+        else:
+            intrv_tree[first_txn_seq_no:last_txn_seq_no + 1] = (view_no, pp_seq_no)
+            self.txn_seq_range_to_3phase_key[ledger_id][1] = None
         logger.debug('{} storing 3PC key {} for ledger {} range {}'.
                      format(self, (view_no, pp_seq_no), ledger_id,
                             (first_txn_seq_no, last_txn_seq_no)))
@@ -3538,12 +3563,12 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
                         (msg.viewNo,
                          msg.ppSeqNo),
                         self.ledgerManager.last_caught_up_3PC) >= 0:
-                    logger.debug(
+                    logger.info(
                         '{} ignoring stashed ordered msg {} since ledger '
                         'manager has last_caught_up_3PC as {}'.format(
                             self, msg, self.ledgerManager.last_caught_up_3PC))
                     continue
-                logger.debug(
+                logger.info(
                     '{} applying stashed Ordered msg {}'.format(self, msg))
                 # Since the PRE-PREPAREs ans PREPAREs corresponding to these
                 # stashed ordered requests was not processed.
@@ -3552,7 +3577,7 @@ class Node(HasActionQueue, Motor, Propagator, MessageProcessor, HasFileStorage,
             self.processOrdered(msg)
             i += 1
 
-        logger.debug(
+        logger.info(
             "{} processed {} stashed ordered requests".format(
                 self, i))
         # Resetting monitor after executing all stashed requests so no view
